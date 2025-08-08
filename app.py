@@ -1,341 +1,257 @@
-import streamlit as st
-import PyPDF2
-import openai
 import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+import base64
+
+import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-from fpdf import FPDF
 
-# === BRANDING ===
-COUNCIL_NAME = "Wyndham City Council"
-COUNCIL_LOGO = "https://www.wyndham.vic.gov.au/themes/custom/wyndham/logo.png"
-GOV_ICON = "https://cdn-icons-png.flaticon.com/512/3209/3209872.png"
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.chains import RetrievalQA
 
-# PAGE STYLING
-st.set_page_config(page_title="PolicySimplify AI", page_icon="✅", layout="centered")
-st.markdown("""
-    <style>
-    body, .stApp { background-color: #eaf3fa; }
-    .main { background-color: #eaf3fa; }
-    .reportview-container { background-color: #eaf3fa; }
-    .reminder { color: #fff; background:#e65c5c; padding: 6px 12px; border-radius: 6px; margin-right: 8px; }
-    .reminder-upcoming { color: #fff; background:#f3c852; padding: 6px 12px; border-radius: 6px; margin-right: 8px; }
-    </style>
-""", unsafe_allow_html=True)
-
-# --- HEADER ---
-st.markdown(f"""
-<div style="background:#1764a7;padding:20px 0 10px 0;border-radius:16px 16px 0 0;">
-    <div style="display:flex;flex-direction:column;align-items:center;gap:0;">
-        <img src="{GOV_ICON}" width="40" style="margin-bottom:8px" />
-        <div style="font-size:2.1em;font-weight:700;color:white;">PolicySimplify AI</div>
-        <span style="color:#bfe2ff;font-size:1.08em;">Council: <b>Wyndham City Council</b></span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div style="margin-top:12px; margin-bottom:12px;">
-    <div style="text-align:center;font-size:1.13em;color:#1764a7;">
-        Upload council policies & instantly see what matters.<br>
-        <span style="color:#59c12a;font-weight:500;">Australian-hosted • Secure • Unlimited uploads</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-st.markdown("---")
-
-# === OPENAI KEY ===
+# --- LOAD ENV/CONFIG ---
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+INCIDENT_AI_ADMIN_PASS = os.getenv("INCIDENT_AI_ADMIN_PASS", "admin123")
+COUNCIL_NAME = os.getenv("COUNCIL_NAME", "Wyndham City Council")
+COUNCIL_LOGO = os.getenv("COUNCIL_LOGO", "https://www.wyndham.vic.gov.au/themes/custom/wyndham/logo.png")
+COUNCIL_COLOR = os.getenv("COUNCIL_COLOR", "#fe7e36")
+LANG = "English"
 
-# === SESSION STATE ===
-if 'obligations' not in st.session_state:
-    st.session_state['obligations'] = {}  # key: filename, value: list of dicts
+st.set_page_config(f"{COUNCIL_NAME} – IncidentResponder AI", layout="wide", page_icon="🚨")
 
-if 'audit_log' not in st.session_state:
-    st.session_state['audit_log'] = []  # {action, file, obligation, who, time}
+# --- SESSION STATE INIT ---
+if 'incident_history' not in st.session_state:
+    st.session_state.incident_history = []  # list of tuples: (ref, status, sender, msg, file_link, ai_reply, feedback)
+if 'role' not in st.session_state:
+    st.session_state.role = "Resident"
+if 'pdf_index' not in st.session_state:
+    st.session_state.pdf_index = None
 
-if 'search_text' not in st.session_state:
-    st.session_state['search_text'] = ""
+# --- HELPERS ---
+def generate_ref():
+    date = datetime.now().strftime("%Y%m%d")
+    uid = str(uuid.uuid4())[:6]
+    return f"INC-{date}-{uid}"
 
-# === FILE UPLOAD ===
-uploaded_files = st.file_uploader("📄 Upload Policy PDF(s)", type=["pdf"], accept_multiple_files=True)
+def get_text_download_link(text, filename):
+    b64 = base64.b64encode(text.encode()).decode()
+    return f'<a href="data:text/plain;base64,{b64}" download="{filename}">Download Reply</a>'
 
-# --- EXTRACT, AI SUMMARIZE, AND PARSE OBLIGATIONS ---
-def extract_pdf_text(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() or ""
-    return text
-
-def ai_summarize(text):
-    prompt = f"""
-You are a compliance AI assistant for Australian councils.
-Given the following policy document, provide:
-
-1. A plain-English summary (3-5 sentences).
-2. A bullet-point list of every compliance obligation, including:
-   - What must be done
-   - Deadline (if any)
-   - Who is responsible (if possible)
-   - If no deadline, suggest one if appropriate (e.g., "every year", "within 30 days")
-Format your response as:
-Summary:
-...
-Obligations:
-- Obligation (deadline, responsible)
-- ...
-Policy text:
-\"\"\"
-{text[:5000]}
-\"\"\"
-"""
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=700
+# --- BRANDING HEADER ---
+def header():
+    st.markdown(
+        f"""
+        <div style='background: linear-gradient(90deg, {COUNCIL_COLOR} 0%, #ff3d3d 100%); border-radius:32px; padding:24px 12px 16px 32px; margin-bottom:12px; display:flex; align-items:center'>
+            <img src="{COUNCIL_LOGO}" style="height:60px;border-radius:16px;margin-right:24px;">
+            <span style="font-size:40px;font-weight:bold;color:white;vertical-align:middle;margin-left:6px;">
+                {COUNCIL_NAME} <span style="font-weight:400;">IncidentResponder AI</span>
+            </span>
+        </div>
+        """, unsafe_allow_html=True
     )
-    return response.choices[0].message.content.strip()
 
-def ai_chat(query, all_policy_text):
-    prompt = f"""
-You are a helpful AI compliance assistant. Here is the combined text of all policies uploaded:
+def sidebar():
+    with st.sidebar:
+        st.image(COUNCIL_LOGO, width=96)
+        st.markdown(
+            f"""
+            <div style="font-size:22px;font-weight:bold;margin-top:8px;margin-bottom:14px;color:{COUNCIL_COLOR}">
+                {COUNCIL_NAME}
+            </div>
+            """, unsafe_allow_html=True
+        )
+        st.info("IncidentResponder AI helps residents and staff report and resolve incidents or complaints using official council policies.")
+        nav = st.radio(
+            "Navigate",
+            [
+                "Incident Assistant",
+                "Submit Incident",
+                "Incident History",
+                "Admin Panel"
+            ],
+            index=0, key="nav"
+        )
+        st.markdown("---")
+    return nav
 
-\"\"\"{all_policy_text[:6000]}\"\"\"
-
-Answer this council staff question using ONLY the info above. If unsure, say "Not specified in current policies."
-
-Question: {query}
-"""
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=400
+def try_asking():
+    st.markdown(
+        """
+        <div style='margin-bottom:18px;'>
+            <span style="font-size:18px;color:#fd4c3d;font-weight:600;">💡 Try reporting:</span><br>
+        </div>
+        """, unsafe_allow_html=True
     )
-    return response.choices[0].message.content.strip()
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.button("Missed bin collection", use_container_width=True, key="q1")
+    with col2: st.button("Noise complaint", use_container_width=True, key="q2")
+    with col3: st.button("Lost pet", use_container_width=True, key="q3")
+    with col4: st.button("Dangerous pothole", use_container_width=True, key="q4")
 
-# --- REMINDER LOGIC ---
-def get_deadline_color(deadline_str):
-    if not deadline_str: return None
-    try:
-        # Interpret as "YYYY-MM-DD" or "within 30 days" etc.
-        if "within" in deadline_str or "every" in deadline_str:
-            return "reminder-upcoming"
-        date = pd.to_datetime(deadline_str, errors="coerce")
-        if pd.isnull(date): return None
-        today = pd.Timestamp.now()
-        if date < today:
-            return "reminder"  # Overdue
-        elif (date - today).days <= 7:
-            return "reminder-upcoming"  # Due soon
-    except:
-        return None
+# --- PDF INDEXING/AI ---
+def build_pdf_index(pdf_dir: Path, faiss_index_path: str):
+    loader = PyPDFDirectoryLoader(str(pdf_dir))
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180)
+    split_docs = splitter.split_documents(docs)
+    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+    vectorstore = FAISS.from_documents(split_docs, embeddings)
+    vectorstore.save_local(faiss_index_path)
+    return vectorstore
+
+def load_faiss_index(faiss_index_path: str, embeddings):
+    if os.path.exists(faiss_index_path):
+        return FAISS.load_local(faiss_index_path, embeddings)
     return None
 
-# --- PDF Processing ---
-if uploaded_files:
-    all_policy_text = ""
-    for uploaded_file in uploaded_files:
-        pdf_text = extract_pdf_text(uploaded_file)
-        all_policy_text += "\n\n" + pdf_text
-
-        if uploaded_file.name not in st.session_state['obligations']:
-            with st.spinner(f"Processing {uploaded_file.name}..."):
-                ai_response = ai_summarize(pdf_text)
-                summary_part, obligations_part = ai_response.split("Obligations:", 1) if "Obligations:" in ai_response else (ai_response, "")
-                obligations_list = []
-                for line in obligations_part.strip().split("\n"):
-                    if line.strip().startswith("-"):
-                        # Attempt to extract deadline from obligation
-                        text = line.strip()[1:].strip()
-                        deadline = ""
-                        for kw in ["by ", "before ", "within ", "every ", "on ", "due ", "deadline:"]:
-                            if kw in text.lower():
-                                deadline = text[text.lower().find(kw):]
-                                break
-                        obligations_list.append({
-                            "text": text,
-                            "done": False,
-                            "assigned_to": "",
-                            "deadline": deadline,
-                            "timestamp": None
-                        })
-                st.session_state['obligations'][uploaded_file.name] = {
-                    "summary": summary_part.strip(),
-                    "obligations": obligations_list
-                }
-                st.session_state['audit_log'].append({
-                    "action": "upload",
-                    "file": uploaded_file.name,
-                    "obligation": "",
-                    "who": "You",
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M")
-                })
-
-    # === REMINDERS BAR ===
-    st.markdown("### ⏰ Reminders")
-    reminder_count, upcoming_count = 0, 0
-    for fname, doc in st.session_state['obligations'].items():
-        for obl in doc["obligations"]:
-            color = get_deadline_color(obl.get("deadline", ""))
-            if color == "reminder":
-                st.markdown(f'<span class="reminder">Overdue:</span> <b>{obl["text"]}</b>', unsafe_allow_html=True)
-                reminder_count += 1
-            elif color == "reminder-upcoming":
-                st.markdown(f'<span class="reminder-upcoming">Due Soon:</span> <b>{obl["text"]}</b>', unsafe_allow_html=True)
-                upcoming_count += 1
-    if reminder_count == 0 and upcoming_count == 0:
-        st.info("No overdue or upcoming deadlines!")
-
-    # === FULL-TEXT SEARCH ===
-    st.markdown("---")
-    st.markdown("### 🔍 Full-Text Search")
-    search_text = st.text_input("Search all obligations, summaries, and policies...", key="search")
-    st.session_state['search_text'] = search_text
-    dashboard_data = []
-    for fname, doc in st.session_state['obligations'].items():
-        for obl in doc["obligations"]:
-            match = (
-                (search_text.lower() in obl["text"].lower() if search_text else True) or
-                (search_text.lower() in doc["summary"].lower() if search_text else True)
-            )
-            if match:
-                dashboard_data.append({
-                    "Filename": fname,
-                    "Summary": doc["summary"][:100]+"..." if len(doc["summary"]) > 100 else doc["summary"],
-                    "Obligation": obl["text"],
-                    "Done": "✅" if obl["done"] else "⬜️",
-                    "Assigned to": obl.get("assigned_to",""),
-                    "Deadline": obl.get("deadline",""),
-                    "Timestamp": obl.get("timestamp","")
-                })
-    if dashboard_data:
-        df = pd.DataFrame(dashboard_data)
-        st.dataframe(df, use_container_width=True)
-        st.download_button(
-            label="Download Obligations CSV",
-            data=df.to_csv(index=False),
-            file_name="policy_obligations.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("No matching obligations found.")
-
-    # === OBLIGATION CARDS ===
-    st.markdown("---")
-    for fname, doc in st.session_state['obligations'].items():
-        with st.expander(f"📑 {fname}", expanded=False):
-            st.markdown(f"**Summary:**<br>{doc['summary']}", unsafe_allow_html=True)
-            st.markdown("**Obligations & Actions:**")
-            for idx, obl in enumerate(doc['obligations']):
-                cols = st.columns([0.07,0.68,0.13,0.12])
-                with cols[0]:
-                    checked = st.checkbox("", value=obl['done'], key=f"{fname}_check_{idx}")
-                    if checked != obl['done']:
-                        doc['obligations'][idx]['done'] = checked
-                        doc['obligations'][idx]['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        st.session_state['audit_log'].append({
-                            "action": "check" if checked else "uncheck",
-                            "file": fname,
-                            "obligation": obl['text'],
-                            "who": "You",
-                            "time": doc['obligations'][idx]['timestamp']
-                        })
-                with cols[1]:
-                    st.markdown(obl['text'])
-                with cols[2]:
-                    assigned_to = st.text_input(
-                        "Assign", value=obl.get("assigned_to",""), key=f"{fname}_assign_{idx}", label_visibility="collapsed", placeholder="Assign to"
-                    )
-                    if assigned_to != obl.get("assigned_to",""):
-                        doc['obligations'][idx]['assigned_to'] = assigned_to
-                        st.session_state['audit_log'].append({
-                            "action": "assign",
-                            "file": fname,
-                            "obligation": obl['text'],
-                            "who": assigned_to,
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M")
-                        })
-                with cols[3]:
-                    deadline = st.text_input(
-                        "Deadline", value=obl.get("deadline",""), key=f"{fname}_deadline_{idx}", label_visibility="collapsed", placeholder="Deadline (YYYY-MM-DD)"
-                    )
-                    if deadline != obl.get("deadline",""):
-                        doc['obligations'][idx]['deadline'] = deadline
-                        st.session_state['audit_log'].append({
-                            "action": "deadline_change",
-                            "file": fname,
-                            "obligation": obl['text'],
-                            "who": "You",
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M")
-                        })
-            st.caption("AI-generated. Please review obligations before action.")
-
-    # === POLICY Q&A CHAT ===
-    st.markdown("---")
-    st.markdown("## 🤖 Ask Your Policies (AI Chat)")
-    st.caption("Type a question about your policies. The AI answers ONLY using your uploaded documents.")
-    query = st.text_input("Ask a policy/compliance question", key="policy_qa")
-    if query:
-        with st.spinner("Getting answer..."):
-            answer = ai_chat(query, all_policy_text)
-        st.success(answer)
-
-    # === AUDIT LOG + PDF EXPORT ===
-    st.markdown("---")
-    st.markdown("## 🕵️ Audit Log & One-Click Audit Pack")
-    st.caption("All major actions are tracked for compliance and audit reporting.")
-    audit_df = pd.DataFrame(st.session_state['audit_log'])
-    st.dataframe(audit_df, use_container_width=True)
-    st.download_button(
-        label="Download Audit Log CSV",
-        data=audit_df.to_csv(index=False),
-        file_name="audit_log.csv",
-        mime="text/csv"
+def ai_incident_response(incident: str, vectorstore):
+    prompt = (
+        "You are an Australian council incident and complaint assistant. "
+        "Categorize the incoming complaint or incident and reply ONLY using official council policies and FAQs. "
+        "Reply with the correct process, any required forms, what to expect next, and if relevant, escalation info."
     )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-4o", temperature=0)
+    chain = RetrievalQA.from_chain_type(
+        llm, retriever=retriever,
+        return_source_documents=False
+    )
+    resp = chain({"query": f"{prompt}\n\nIncident: {incident}"})
+    return resp.get("result", "No answer found.")
 
-    # --- Branded PDF Export ---
-    def export_pdf(dataframe, filename="policy_obligations.pdf", title="Obligation Report"):
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 16)
-        pdf.set_text_color(23, 100, 167)
-        pdf.cell(0, 10, COUNCIL_NAME, ln=1, align="C")
-        pdf.image(COUNCIL_LOGO, x=10, y=12, w=30)
-        pdf.ln(10)
-        pdf.set_font("Arial", "B", 12)
-        pdf.set_text_color(23, 100, 167)
-        pdf.cell(0, 10, title, ln=1)
-        pdf.set_font("Arial", size=10)
-        pdf.set_text_color(0, 0, 0)
-        for i, row in dataframe.iterrows():
-            pdf.cell(0, 8, f"{i+1}. {row['Obligation']} | {row['Done']} | Assigned: {row['Assigned to']} | Deadline: {row['Deadline']}", ln=1)
-        pdf.output(filename)
-        with open(filename, "rb") as f:
-            pdf_bytes = f.read()
-        return pdf_bytes
+header()
+sidebar_choice = sidebar()
 
-    st.markdown("### 📄 Download Pretty PDF Export")
-    if len(dashboard_data) > 0:
-        if st.button("Download Compliance PDF"):
-            pdf_bytes = export_pdf(pd.DataFrame(dashboard_data), title="Obligations Compliance Pack")
-            st.download_button("Download PDF", pdf_bytes, file_name="policy_obligations.pdf", mime="application/pdf")
+faiss_path = f"index/faiss_index"
+pdf_dir = Path("council_docs")
+uploads_dir = Path("uploads")
+uploads_dir.mkdir(exist_ok=True, parents=True)
 
-    st.markdown("### 🏛️ Download Branded Audit Pack PDF")
-    if len(audit_df) > 0:
-        if st.button("Download Audit Pack PDF"):
-            pdf_bytes = export_pdf(audit_df.rename(columns={"action":"Obligation"}), filename="audit_pack.pdf", title="Audit Log Pack")
-            st.download_button("Download PDF", pdf_bytes, file_name="audit_pack.pdf", mime="application/pdf")
+embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
-else:
-    st.info("Upload one or more council policy PDFs to begin.")
+# Load PDF index at startup
+if st.session_state.pdf_index is None:
+    if os.path.exists(faiss_path):
+        st.session_state.pdf_index = load_faiss_index(faiss_path, embeddings)
 
-st.markdown("---")
-st.markdown("""
-<span style='color: #59c12a; font-weight:bold;'>PolicySimplify AI – Built for Australian councils. All data hosted securely in Australia.</span>
+# --- Routing ---
+if sidebar_choice == "Incident Assistant":
+    st.markdown("### 💬 Report an Incident or Complaint")
+    try_asking()
+    if st.session_state.pdf_index is None:
+        st.warning("No official documents indexed yet. Please upload relevant policies/FAQs via the Admin Panel.")
+    else:
+        st.markdown("#### Incident History (this session)")
+        for idx, (ref, status, sender, msg, file_link, ai_reply, feedback) in enumerate(reversed(st.session_state.incident_history)):
+            st.markdown(f"**Ref:** {ref} | **Status:** {status}")
+            st.markdown(f"<b>{sender}:</b> {msg}", unsafe_allow_html=True)
+            if file_link:
+                st.markdown(f"<a href='{file_link}' target='_blank'>[File Attached]</a>", unsafe_allow_html=True)
+            if ai_reply:
+                st.markdown(f"**AI Reply:** {ai_reply}")
+                st.markdown(get_text_download_link(ai_reply, f"incident_reply_{ref}.txt"), unsafe_allow_html=True)
+                col1, col2, col3 = st.columns([1, 1, 2])
+                if feedback == "":
+                    if col1.button("👍", key=f"up_{idx}"):
+                        # Update feedback
+                        actual_idx = len(st.session_state.incident_history) - 1 - idx
+                        old = list(st.session_state.incident_history[actual_idx])
+                        old[6] = "up"
+                        st.session_state.incident_history[actual_idx] = tuple(old)
+                    if col2.button("👎", key=f"down_{idx}"):
+                        actual_idx = len(st.session_state.incident_history) - 1 - idx
+                        old = list(st.session_state.incident_history[actual_idx])
+                        old[6] = "down"
+                        st.session_state.incident_history[actual_idx] = tuple(old)
+                else:
+                    col3.success(f"Feedback: {'👍' if feedback == 'up' else '👎'}")
+                if status == "open":
+                    if st.button("Escalate to staff", key=f"escalate_{idx}"):
+                        actual_idx = len(st.session_state.incident_history) - 1 - idx
+                        old = list(st.session_state.incident_history[actual_idx])
+                        old[1] = "escalated"
+                        st.session_state.incident_history[actual_idx] = tuple(old)
+                        st.success("Incident escalated to staff.")
+            st.markdown("---")
+
+    inc = st.text_input("Describe your complaint or incident...", key="incident_box")
+    file_upload = st.file_uploader("Attach a photo or PDF (optional)", type=["jpg", "jpeg", "png", "pdf"])
+    if st.button("Send", key="sendbtn") and inc:
+        file_link = ""
+        if file_upload is not None:
+            file_path = uploads_dir / file_upload.name
+            with open(file_path, "wb") as f:
+                f.write(file_upload.getbuffer())
+            file_link = f"/uploads/{file_upload.name}"
+        ref = generate_ref()
+        reply = "AI not ready. Please upload council documents." if st.session_state.pdf_index is None else ai_incident_response(inc, st.session_state.pdf_index)
+        st.session_state.incident_history.append((ref, "open", "You", inc, file_link, reply, ""))  # feedback is ""
+        st.experimental_rerun()
+
+elif sidebar_choice == "Submit Incident":
+    st.header("Submit a New Incident/Complaint")
+    with st.form("incident_form"):
+        inc_msg = st.text_area("Describe your incident or complaint.")
+        inc_file = st.file_uploader("Attach a photo or PDF (optional)", type=["jpg", "jpeg", "png", "pdf"])
+        inc_email = st.text_input("Your email for follow-up (optional)")
+        sent = st.form_submit_button("Submit")
+        if sent and inc_msg:
+            file_link = ""
+            if inc_file is not None:
+                file_path = uploads_dir / inc_file.name
+                with open(file_path, "wb") as f:
+                    f.write(inc_file.getbuffer())
+                file_link = f"/uploads/{inc_file.name}"
+            ref = generate_ref()
+            # AI reply can be generated here or by staff
+            st.session_state.incident_history.append((ref, "open", "You", inc_msg, file_link, "", ""))
+            st.success(f"Your incident (Ref: {ref}) was submitted. If unresolved, staff will follow up.")
+
+elif sidebar_choice == "Incident History":
+    st.header("Incident History & Session Log")
+    st.write(f"Incidents reported: {len(st.session_state.incident_history)}")
+    df = pd.DataFrame(st.session_state.incident_history,
+        columns=["Reference", "Status", "Sender", "Message", "File", "AI Reply", "Feedback"])
+    st.dataframe(df, use_container_width=True)
+    if len(df) > 0:
+        csv = df.to_csv(index=False)
+        b64 = base64.b64encode(csv.encode()).decode()
+        href = f'<a href="data:file/csv;base64,{b64}" download="incident_log.csv">Download CSV</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+elif sidebar_choice == "Admin Panel":
+    st.header("Admin Panel")
+    if st.session_state.role != "Admin":
+        pwd = st.text_input("Enter admin password", type="password")
+        if st.button("Login as admin"):
+            if pwd == INCIDENT_AI_ADMIN_PASS:
+                st.session_state.role = "Admin"
+                st.success("Welcome, admin.")
+                st.experimental_rerun()
+            else:
+                st.error("Incorrect password.")
+    else:
+        st.write(f"Upload Council PDFs (policies, FAQs, forms)")
+        uploaded_pdfs = st.file_uploader("Upload multiple PDFs", accept_multiple_files=True, type="pdf")
+        if uploaded_pdfs:
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            for pdf in uploaded_pdfs:
+                with open(pdf_dir / pdf.name, "wb") as f:
+                    f.write(pdf.getbuffer())
+            st.session_state.pdf_index = build_pdf_index(pdf_dir, faiss_path)
+            st.success("PDFs indexed for incident response! Return to Assistant to try it out.")
+        if st.button("Reset Session"):
+            st.session_state.incident_history = []
+            st.session_state.pdf_index = None
+            st.success("Session reset.")
+
+st.markdown(f"""
+<br>
+<div style='font-size:13px;text-align:center;color:#aaa'>Made with 🚨 IncidentResponder AI – for {COUNCIL_NAME}, powered by AI</div>
 """, unsafe_allow_html=True)
