@@ -1,0 +1,45 @@
+name: Wyndham Daily GCS Upload
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # daily at 02:00 UTC (~12pm AEST)
+  workflow_dispatch:       # allow manual run from Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcs-key.json
+      # Optional tunables for the script (override as you like):
+      MAX_WORKERS: "10"
+      HTTP_TIMEOUT: "25"
+      USER_AGENT: "IncidentAI-Downloader/3.0 (+https://incidentai.com)"
+      WyndhamSitemap: "https://www.wyndham.vic.gov.au/sitemap.xml"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write GCP service account key
+        run: echo '${{ secrets.GCP_SA_KEY }}' > gcs-key.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml google-cloud-storage
+
+      - name: Run Wyndham crawler (direct to GCS)
+        run: python wyndham_gcs_downloader.py
+
+      # Optional: show quick tail of log success
+      - name: List manifest files uploaded (debug)
+        if: always()
+        run: |
+          echo "Crawler finished. Check GCS: gs://${{ env.GCS_BUCKET }}/policies/wyndham/"
