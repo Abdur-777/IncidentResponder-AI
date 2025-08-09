@@ -1,9 +1,9 @@
-streamlit==1.33.0
-pandas>=2.0.0
-python-dotenv>=1.0.0
+streamlit==1.32.0
+python-dotenv
 langchain==0.1.16
 langchain-community==0.0.32
 langchain-openai==0.0.8
-openai==1.17.0
-tiktoken==0.7.0
-PyPDF2>=3.0.1
+faiss-cpu==1.8.0
+google-cloud-storage
+yagmail
+PyPDF2
