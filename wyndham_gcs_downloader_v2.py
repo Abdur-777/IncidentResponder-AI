@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-# Wyndham → GCS direct uploader (sitemap + on-page link discovery)
-import os, re, sys, io, csv, hashlib, concurrent.futures
-from urllib.parse import urlparse, urljoin, urldefrag
+# Deep crawler for Wyndham: save locally + upload to GCS immediately
+import os, re, sys, time, hashlib, queue
+from pathlib import Path
+from urllib.parse import urlparse, urljoin, urldefrag, quote
 import requests
 from bs4 import BeautifulSoup
-from google.cloud import storage
 
-# ---------- Required env ----------
-BUCKET_NAME = os.getenv("GCS_BUCKET")
-if not BUCKET_NAME:
-    print("ERROR: set GCS_BUCKET env var", file=sys.stderr); sys.exit(1)
-
-# ---------- Tunables (can override via env in the workflow) ----------
-ROOT_SITEMAP = os.getenv("WyndhamSitemap", "https://www.wyndham.vic.gov.au/sitemap.xml")
-MAX_WORKERS  = int(os.getenv("MAX_WORKERS", "10"))
-TIMEOUT      = int(os.getenv("HTTP_TIMEOUT", "25"))
-USER_AGENT   = os.getenv("USER_AGENT", "IncidentAI-Downloader/3.0 (+https://incidentai.com)")
+# ----- CONFIG (env-overridable) -----
+START_URL   = os.getenv("START_URL", "https://www.wyndham.vic.gov.au/")
+DOMAIN      = os.getenv("DOMAIN", "wyndham.vic.gov.au")
+MAX_DEPTH   = int(os.getenv("MAX_DEPTH", "5"))        # crawl depth
+MAX_PAGES   = int(os.getenv("MAX_PAGES", "5000"))     # safety limit
+CRAWL_DELAY = float(os.getenv("CRAWL_DELAY", "0.2"))  # seconds between page fetches
+TIMEOUT     = int(os.getenv("HTTP_TIMEOUT", "25"))
+USER_AGENT  = os.getenv("USER_AGENT", "IncidentAI-Deep/1.0 (+https://incidentai.com)")
 
 ALLOWED_EXTS = (".pdf",".docx",".doc",".xlsx",".xls",".csv",".rtf",".pptx",".zip")
+
+# Local save root
+OUT_ROOT = Path("policies/wyndham")  # e.g. policies/wyndham/<category>/<file>
 
 # ---------- Categories ----------
 CATEGORY_RULES = [
@@ -49,147 +50,151 @@ def guess_category(text: str) -> str:
     return "uncategorized"
 
 # ---------- GCS ----------
-GCS = storage.Client()
-BUCKET = GCS.bucket(BUCKET_NAME)
-BASE_PREFIX    = "policies/wyndham"
-HASH_INDEX_DIR = f"{BASE_PREFIX}/_hash_index"
-MANIFEST_PATH  = f"{BASE_PREFIX}/manifests/docs.csv"
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+if not GCS_BUCKET:
+    print("ERROR: set GCS_BUCKET env var (e.g., civreply-data).", file=sys.stderr)
+    sys.exit(1)
 
-def blob_exists(name: str) -> bool:
-    return BUCKET.blob(name).exists()
-
-def upload_bytes(name: str, data: bytes, ctype: str):
-    BUCKET.blob(name).upload_from_string(data, content_type=ctype)
-
-def append_manifest(rows):
-    # append (or create with header)
-    blob = BUCKET.blob(MANIFEST_PATH)
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    if not blob.exists():
-        w.writerow(["url","filename","category","size_bytes","sha256"])
-    else:
-        buf.write(blob.download_as_text())
-    for r in rows:
-        w.writerow(r)
-    upload_bytes(MANIFEST_PATH, buf.getvalue().encode("utf-8"), "text/csv")
+try:
+    from google.cloud import storage
+    GCS_CLIENT = storage.Client()
+    BUCKET = GCS_CLIENT.bucket(GCS_BUCKET)
+except Exception as e:
+    print("ERROR: google-cloud-storage not configured/authenticated.", file=sys.stderr)
+    print("Hint: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json", file=sys.stderr)
+    raise
 
 # ---------- HTTP ----------
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
-def http_get(url, **kw): return SESSION.get(url, timeout=TIMEOUT, **kw)
 
+def http_get(url, **kw):
+    return SESSION.get(url, timeout=TIMEOUT, **kw)
+
+# ---------- Helpers ----------
 def normalize(u: str) -> str:
     u, _ = urldefrag(u)
     return u.strip()
 
-def is_wyndham(url: str) -> bool:
+def is_internal(url: str) -> bool:
     host = urlparse(url).netloc.lower()
-    return host == "wyndham.vic.gov.au" or host.endswith(".wyndham.vic.gov.au")
-
-def list_sitemap_pages(root: str):
-    urls, stack = set(), [root]
-    while stack:
-        sm = stack.pop()
-        try:
-            r = http_get(sm); r.raise_for_status()
-        except Exception as e:
-            print(f"[warn] sitemap fetch failed {sm}: {e}", file=sys.stderr); continue
-        soup = BeautifulSoup(r.text, "xml")
-        for s in soup.find_all("sitemap"):
-            loc = s.find("loc");  loc and stack.append(loc.get_text(strip=True))
-        for u in soup.find_all("url"):
-            loc = u.find("loc");  loc and urls.add(normalize(loc.get_text(strip=True)))
-    return [u for u in urls if is_wyndham(u)]
+    return host == DOMAIN or host.endswith("." + DOMAIN)
 
 def looks_like_doc(url: str) -> bool:
     path = urlparse(url).path.lower()
-    return any(path.endswith(ext) for ext in ALLOWED_EXTS)
-
-def is_doc_link(url: str) -> bool:
-    # quick pass by extension; if uncertain, peek headers
-    if looks_like_doc(url): return True
-    try:
-        r = http_get(url, stream=True)
-        ctype = r.headers.get("content-type","").lower()
-        return ("application/pdf" in ctype) or any(ext.strip(".") in ctype for ext in ALLOWED_EXTS)
-    except Exception:
-        return False
-
-def discover_doc_links(pages):
-    found = set()
-    def scan(page_url):
-        try:
-            r = http_get(page_url); r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-            links = []
-            for a in soup.select("a[href]"):
-                link = normalize(urljoin(page_url, a["href"]))
-                if not link.startswith("http"): continue
-                if not is_wyndham(link): continue
-                if is_doc_link(link):
-                    links.append(link)
-            return links
-        except Exception:
-            return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for links in ex.map(scan, pages):
-            for l in links: found.add(l)
-    return sorted(found)
+    if any(path.endswith(ext) for ext in ALLOWED_EXTS):
+        return True
+    # Drupal files often in /sites/default/files/
+    return "/sites/default/files/" in path
 
 def sha256_bytes(b: bytes) -> str:
+    import hashlib
     h = hashlib.sha256(); h.update(b); return h.hexdigest()
 
-def upload_doc(url: str):
+def safe_filename(name: str) -> str:
+    # keep extension, sanitize base
+    base = Path(name).stem
+    ext  = Path(name).suffix
+    base = re.sub(r"[^a-zA-Z0-9._-]+", "_", base)[:150]
+    return (base or "file") + ext
+
+def save_local_and_gcs(url: str, data: bytes):
+    # Decide filename/category
+    path = urlparse(url).path
+    fname = safe_filename(Path(path).name or "file")
+    cat = guess_category(fname + " " + url)
+
+    # Local save
+    dest_dir = OUT_ROOT / cat
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / fname
+    with open(dest, "wb") as f:
+        f.write(data)
+
+    # Upload to GCS (mirror structure)
+    remote = f"policies/wyndham/{cat}/{fname}"
+    blob = BUCKET.blob(remote)
+    blob.upload_from_filename(str(dest))
+
+    return cat, fname, dest, remote
+
+# Dedup by content hash in GCS
+def already_uploaded(h: str) -> bool:
+    marker = f"policies/wyndham/_hash_index/{h}"
+    return BUCKET.blob(marker).exists()
+
+def mark_uploaded(h: str):
+    marker = f"policies/wyndham/_hash_index/{h}"
+    BUCKET.blob(marker).upload_from_string(b"")
+
+# ---------- Core ----------
+def download_if_doc(url: str):
     try:
-        r = http_get(url); r.raise_for_status()
+        r = http_get(url, stream=True)
+        r.raise_for_status()
         data = r.content
         h = sha256_bytes(data)
-        marker = f"{HASH_INDEX_DIR}/{h}"
-        if blob_exists(marker):
-            return ("skip", url)
-
-        fname = os.path.basename(urlparse(url).path) or "file"
-        cat   = guess_category(f"{fname} {url}")
-        dest  = f"{BASE_PREFIX}/{cat}/{fname}"
-        ctype = "application/pdf" if fname.lower().endswith(".pdf") else "application/octet-stream"
-
-        upload_bytes(dest, data, ctype)
-        upload_bytes(marker, b"", "application/octet-stream")
-        return ("ok", url, fname, cat, len(data), h)
+        if already_uploaded(h):
+            return ("skip", url, "dupe")
+        cat, fname, dest, remote = save_local_and_gcs(url, data)
+        mark_uploaded(h)
+        print(f"[ok] {cat:<12} {len(data):>8} bytes  {fname}")
+        return ("ok", url, cat, fname, len(data))
     except Exception as e:
         return ("err", url, str(e))
 
-def main():
-    print("[*] Loading sitemap pages…")
-    pages = list_sitemap_pages(ROOT_SITEMAP)
-    pages = [u for u in pages if not looks_like_doc(u)]
-    print(f"[*] pages in sitemap={len(pages)}")
+def crawl():
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    q = queue.Queue()
+    q.put((normalize(START_URL), 0))
 
-    print("[*] Discovering document links on pages…")
-    doc_urls = discover_doc_links(pages)
-    print(f"[*] discovered doc URLs={len(doc_urls)}")
+    pages_crawled = 0
+    uploads = skips = errs = 0
 
-    ok = skip = err = 0
-    rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for res in ex.map(upload_doc, doc_urls):
-            if res[0] == "ok":
-                _, url, fname, cat, size, h = res
-                ok += 1; rows.append([url, fname, cat, size, h])
-                print(f"[ok] {cat:<13} {size:>8}  {fname}")
-            elif res[0] == "skip":
-                skip += 1
+    while not q.empty() and pages_crawled < MAX_PAGES:
+        url, depth = q.get()
+        if url in seen or depth > MAX_DEPTH:
+            continue
+        seen.add(url)
+
+        try:
+            r = http_get(url)
+            r.raise_for_status()
+            pages_crawled += 1
+            if pages_crawled % 50 == 0:
+                print(f"... crawled {pages_crawled} pages, queue={q.qsize()}, depth={depth}")
+        except Exception as e:
+            print(f"[warn] fetch failed {url} :: {e}", file=sys.stderr)
+            continue
+
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Process all links on the page
+        for a in soup.select("a[href]"):
+            raw = a.get("href", "")
+            link = normalize(urljoin(url, raw))
+            if not link.startswith("http"):
+                continue
+            if not is_internal(link):
+                continue
+
+            if looks_like_doc(link):
+                res = download_if_doc(link)
+                if res[0] == "ok": uploads += 1
+                elif res[0] == "skip": skips += 1
+                else:
+                    errs += 1
+                    print(f"[err] {link} :: {res[2]}", file=sys.stderr)
             else:
-                _, url, msg = res
-                err += 1; print(f"[err] {url} :: {msg}", file=sys.stderr)
+                # enqueue for further crawl
+                q.put((link, depth + 1))
 
-    if rows:
-        append_manifest(rows)
-        print(f"[manifest] gs://{BUCKET_NAME}/{MANIFEST_PATH}")
-    print(f"Done. uploaded={ok}, skipped={skip}, errors={err}")
+        time.sleep(CRAWL_DELAY)
+
+    print(f"\nDone. pages={pages_crawled}, uploaded={uploads}, skipped={skips}, errors={errs}")
 
 if __name__ == "__main__":
     if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        print("WARNING: GOOGLE_APPLICATION_CREDENTIALS is not set (won't auth in local runs).", file=sys.stderr)
-    main()
+        print("WARNING: GOOGLE_APPLICATION_CREDENTIALS not set; GCS auth will fail.", file=sys.stderr)
+    crawl()
