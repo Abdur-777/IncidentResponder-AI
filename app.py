@@ -8,13 +8,18 @@
 
 import os, io, re, csv, json, shutil, tempfile, datetime
 from pathlib import Path
+from typing import List, Tuple
 
 # ---- Load GCP creds from env JSON (Render/Cloud) ----
-if "GCP_SA_JSON" in os.environ:
-    with open("/tmp/gcs-key.json", "w") as f:
-        f.write(os.environ["GCP_SA_JSON"])
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcs-key.json"
+if "GCP_SA_JSON" in os.environ and os.environ["GCP_SA_JSON"].strip():
+    try:
+        with open("/tmp/gcs-key.json", "w") as f:
+            f.write(os.environ["GCP_SA_JSON"].strip())
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcs-key.json"
+    except Exception:
+        pass
 
+# Third‑party libs
 import streamlit as st
 from dotenv import load_dotenv
 from google.cloud import storage
@@ -26,7 +31,7 @@ from pptx import Presentation
 import pandas as pd
 from striprtf.striprtf import rtf_to_text
 
-# LangChain / OpenAI
+# LangChain / OpenAI / FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
@@ -44,15 +49,18 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
+    st.set_page_config(page_title="IncidentResponder AI", page_icon="🚨", layout="wide")
     st.error("❌ Missing OPENAI_API_KEY")
     st.stop()
 
 # Core (single-council deployment)
 COUNCIL        = os.getenv("COUNCIL", "wyndham")
 GCS_BUCKET     = os.getenv("GCS_BUCKET", "civreply-data")
-DOC_PREFIX     = os.getenv("DOC_PREFIX", f"policies/{COUNCIL}")
-INDEX_PREFIX   = os.getenv("INDEX_PREFIX", f"indexes/{COUNCIL}/faiss")
-INDEX_ON_START = os.getenv("INDEX_ON_START", "false").lower() == "true"
+# NOTE: These defaults match your current bucket layout as shown in screenshots
+# (policies/<council>/..., indexes/<council>/faiss/...)
+DOC_PREFIX     = os.getenv("DOC_PREFIX", f"policies/{COUNCIL}")          # where docs live in GCS
+INDEX_PREFIX   = os.getenv("INDEX_PREFIX", f"indexes/{COUNCIL}/faiss")   # where FAISS artifacts live in GCS
+INDEX_ON_START = os.getenv("INDEX_ON_START", "true").lower() == "true"   # build index on app boot if missing
 
 # Branding / UX
 PUBLIC_MODE    = os.getenv("PUBLIC_MODE", "false").lower() == "true"    # read-only portal
@@ -91,9 +99,8 @@ ROUTES = {
     "health":   os.getenv("ROUTE_HEALTH",  ""),
 }
 
-# Paths
+# Paths (local cache of FAISS)
 LOCAL_INDEX = Path(f"index/{COUNCIL}")
-
 SUPPORTED_EXTS = (".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".rtf", ".txt")
 
 # =========================
@@ -101,15 +108,16 @@ SUPPORTED_EXTS = (".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".rtf", ".t
 # =========================
 st.set_page_config(page_title="IncidentResponder AI", page_icon="🚨", layout="wide")
 
+@st.cache_resource(show_spinner=False)
 def gcs_client():
     return storage.Client()
 
-def latest_index_time_str():
+def latest_index_time_str() -> str:
     try:
         blobs = list(gcs_client().list_blobs(GCS_BUCKET, prefix=f"{INDEX_PREFIX}/"))
         if not blobs:
             return "N/A"
-        newest = max((b.updated for b in blobs if b.updated), default=None)
+        newest = max((b.updated for b in blobs if getattr(b, "updated", None)), default=None)
         if newest:
             return newest.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
@@ -138,7 +146,8 @@ with st.container():
                 unsafe_allow_html=True
             )
         sub = "Public read-only mode enabled." if PUBLIC_MODE else "Staff assistant with council policy knowledge."
-        st.caption(sub + ("  •  " + f"Data region: {DATA_REGION}" if ENTERPRISE_MODE and DATA_REGION else ""))
+        extra = f"  •  Data region: {DATA_REGION}" if ENTERPRISE_MODE and DATA_REGION else ""
+        st.caption(sub + extra)
     with col2:
         st.markdown(
             f"""
@@ -154,24 +163,40 @@ st.divider()
 # =========================
 #  HELPERS: GCS / INDEX
 # =========================
-def list_supported_blobs():
-    blobs = list(gcs_client().list_blobs(GCS_BUCKET, prefix=DOC_PREFIX.rstrip("/") + "/"))
+
+def list_supported_blobs() -> List[storage.Blob]:
+    """List all supported files beneath DOC_PREFIX."""
+    prefix = DOC_PREFIX.rstrip("/") + "/"
+    try:
+        blobs = list(gcs_client().list_blobs(GCS_BUCKET, prefix=prefix))
+    except Exception as e:
+        st.warning(f"GCS list error for gs://{GCS_BUCKET}/{DOC_PREFIX}: {e}")
+        return []
     files = [b for b in blobs if b.name.lower().endswith(SUPPORTED_EXTS)]
-    files.sort(key=lambda b: b.updated or 0, reverse=True)
+    files.sort(key=lambda b: b.updated or datetime.datetime.min, reverse=True)
     return files
 
+
 def download_dir_from_gcs(prefix: str, dest_dir: Path) -> bool:
-    blobs = list(gcs_client().list_blobs(GCS_BUCKET, prefix=prefix.rstrip("/") + "/"))
+    """Download an entire GCS prefix into a local directory."""
+    try:
+        blobs = list(gcs_client().list_blobs(GCS_BUCKET, prefix=prefix.rstrip("/") + "/"))
+    except Exception as e:
+        st.warning(f"GCS download list error for {prefix}: {e}")
+        return False
     if not blobs:
         return False
     tmp = Path(tempfile.mkdtemp())
     for b in blobs:
-        rel = b.name[len(prefix)+1:]
+        rel = b.name[len(prefix.rstrip("/") + "/"):]
         if not rel:
             continue
         p = tmp / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        b.download_to_filename(str(p))
+        try:
+            b.download_to_filename(str(p))
+        except Exception as e:
+            st.warning(f"Download failed for {b.name}: {e}")
     dest_dir.mkdir(parents=True, exist_ok=True)
     for p in tmp.rglob("*"):
         if p.is_file():
@@ -180,16 +205,22 @@ def download_dir_from_gcs(prefix: str, dest_dir: Path) -> bool:
             shutil.move(str(p), str(tgt))
     return True
 
+
 def upload_dir_to_gcs(src_dir: Path, prefix: str):
+    """Upload a local directory to a GCS prefix (mirror)."""
     bucket = gcs_client().bucket(GCS_BUCKET)
     for p in src_dir.rglob("*"):
         if p.is_file():
             rel = p.relative_to(src_dir).as_posix()
             key = f"{prefix.rstrip('/')}/{rel}"
-            bucket.blob(key).upload_from_filename(str(p))
+            try:
+                bucket.blob(key).upload_from_filename(str(p))
+            except Exception as e:
+                st.warning(f"Upload failed for {key}: {e}")
+
 
 def signed_url_for_blob_path(gcs_path: str, minutes: int) -> str:
-    # gcs_path can be "gs://bucket/key" or just "key"
+    """Return a time-limited signed URL for a blob path (gs://bucket/key or key)."""
     if gcs_path.startswith("gs://"):
         _, rest = gcs_path.split("gs://", 1)
         bucket_name, key = rest.split("/", 1)
@@ -207,19 +238,26 @@ def signed_url_for_blob_path(gcs_path: str, minutes: int) -> str:
 # =========================
 #  TEXT EXTRACTORS
 # =========================
-def _join(lines): return "\n".join([str(x).strip() for x in lines if str(x).strip()])
+
+def _join(lines):
+    return "\n".join([str(x).strip() for x in lines if str(x).strip()])
+
 
 def extract_pdf(data: bytes) -> str:
     try:
         pages = PdfReader(io.BytesIO(data)).pages
         return _join(p.extract_text() or "" for p in pages)
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_docx(data: bytes) -> str:
     try:
         d = docx.Document(io.BytesIO(data))
         return _join(p.text for p in d.paragraphs)
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_pptx(data: bytes) -> str:
     try:
@@ -232,7 +270,9 @@ def extract_pptx(data: bytes) -> str:
                     txts.append(shp.text)
             out.append(_join(txts))
         return _join(out)
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_xlsx(data: bytes) -> str:
     try:
@@ -242,32 +282,43 @@ def extract_xlsx(data: bytes) -> str:
                 df = xls.parse(sheet)
                 frames.append(f"[Sheet: {sheet}]\n" + df.to_string(index=False))
             return "\n\n".join(frames)
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_xls(data: bytes) -> str:
     try:
         df = pd.read_excel(io.BytesIO(data), engine="xlrd", sheet_name=None)
         return "\n\n".join(f"[Sheet: {s}]\n{d.to_string(index=False)}" for s, d in df.items())
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_csv(data: bytes) -> str:
     try:
         for enc in ("utf-8","utf-8-sig","latin-1"):
             try:
                 txt = data.decode(enc, errors="ignore"); break
-            except Exception: pass
+            except Exception:
+                pass
         return _join(", ".join(r) for r in csv.reader(io.StringIO(txt)))
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_rtf(data: bytes) -> str:
     try:
         return rtf_to_text(data.decode("utf-8", errors="ignore"))
-    except Exception: return ""
+    except Exception:
+        return ""
+
 
 def extract_txt(data: bytes) -> str:
     for enc in ("utf-8","utf-8-sig","latin-1"):
-        try: return data.decode(enc, errors="ignore")
-        except Exception: pass
+        try:
+            return data.decode(enc, errors="ignore")
+        except Exception:
+            pass
     return ""
 
 EXTRACTORS = {
@@ -275,6 +326,7 @@ EXTRACTORS = {
     ".xlsx": extract_xlsx, ".xls": extract_xls, ".csv": extract_csv,
     ".rtf": extract_rtf, ".txt": extract_txt,
 }
+
 def extract_any(name: str, data: bytes) -> str:
     fn = EXTRACTORS.get(Path(name.lower()).suffix)
     return fn(data) if fn else ""
@@ -282,6 +334,7 @@ def extract_any(name: str, data: bytes) -> str:
 # =========================
 #  INDEX BUILD / LOAD
 # =========================
+
 def build_index_from_gcs() -> bool:
     st.session_state["build_logs"] = []
     blobs = list_supported_blobs()
@@ -290,8 +343,9 @@ def build_index_from_gcs() -> bool:
         return False
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180)
-    texts = []
+    texts: List[str] = []
     st.session_state["build_logs"].append(f"Indexing {len(blobs)} files…")
+
     for i, b in enumerate(blobs, 1):
         try:
             data = b.download_as_bytes()
@@ -306,7 +360,7 @@ def build_index_from_gcs() -> bool:
         for chunk in splitter.split_text(header + body):
             texts.append(chunk)
         if i % 20 == 0:
-            st.session_state["build_logs"].append(f"... parsed {i} files")
+            st.session_state["build_logs"].append(f"… parsed {i} files")
 
     if not texts:
         st.session_state["build_logs"].append("No text chunks produced.")
@@ -314,26 +368,31 @@ def build_index_from_gcs() -> bool:
 
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     vs = FAISS.from_texts(texts, embeddings)
+
     LOCAL_INDEX.parent.mkdir(parents=True, exist_ok=True)
     vs.save_local(str(LOCAL_INDEX))
+
+    # Upload the new FAISS artifacts to GCS
     upload_dir_to_gcs(LOCAL_INDEX, INDEX_PREFIX)
 
+    # Write a small meta file so the UI can show "Last indexed"
     meta = {
         "council": COUNCIL,
         "chunks": len(texts),
         "generated_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
     try:
-        storage.Client().bucket(GCS_BUCKET).blob(f"{INDEX_PREFIX}/index_meta.json")\
-            .upload_from_string(json.dumps(meta, indent=2).encode("utf-8"),
-                                content_type="application/json")
+        storage.Client().bucket(GCS_BUCKET).blob(f"{INDEX_PREFIX}/index_meta.json").upload_from_string(
+            json.dumps(meta, indent=2).encode("utf-8"), content_type="application/json")
     except Exception:
         pass
 
     st.session_state["build_logs"].append(f"[done] Index uploaded to gs://{GCS_BUCKET}/{INDEX_PREFIX}")
     return True
 
+
 def load_vectorstore():
+    # Try local cache first
     if LOCAL_INDEX.exists():
         try:
             emb = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
@@ -341,6 +400,7 @@ def load_vectorstore():
         except Exception as e:
             st.warning(f"Local FAISS present but failed to load: {e}")
 
+    # Then download from GCS
     if download_dir_from_gcs(INDEX_PREFIX, LOCAL_INDEX):
         try:
             emb = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
@@ -348,6 +408,7 @@ def load_vectorstore():
         except Exception as e:
             st.warning(f"GCS FAISS downloaded but failed to load: {e}")
 
+    # Optionally build on start
     if INDEX_ON_START:
         with st.spinner("Building index from GCS… (first boot may take minutes)"):
             ok = build_index_from_gcs()
@@ -357,13 +418,15 @@ def load_vectorstore():
 
     return None
 
+
 def get_llm():
     return ChatOpenAI(model_name="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # =========================
 #  LOGGING
 # =========================
-def log_query_to_gcs(mode: str, question: str, answer: str, sources: list):
+
+def log_query_to_gcs(mode: str, question: str, answer: str, sources: List[str]):
     try:
         ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         day = datetime.datetime.utcnow().strftime("%Y%m%d")
@@ -389,7 +452,7 @@ def log_query_to_gcs(mode: str, question: str, answer: str, sources: list):
 # =========================
 #  CATEGORY DETECTION (routing)
 # =========================
-CATEGORY_RULES = [
+CATEGORY_RULES: List[Tuple[str,str]] = [
     ("waste|bin|hard[-_ ]?rubbish|recycling|garbage|litter|landfill|compost|green waste|organic", "waste"),
     ("road|traffic|pothole|parking|transport|footpath|foot-path|bike|bicycle|bridge|intersection|roundabout", "roads"),
     ("animal|pet|dog|cat|livestock|impound|regist|wildlife|vet|microchip", "animals"),
@@ -399,6 +462,8 @@ CATEGORY_RULES = [
     ("plan|permit|building|construction|overlay|zoning|town[-_ ]plan|development application|\\bDA\\b", "planning"),
     ("health|food|safety|public health|inspection|disease|mosquito|covid|hygiene", "health"),
 ]
+
+
 def detect_category(text: str) -> str:
     t = (text or "").lower()
     for pat, cat in CATEGORY_RULES:
@@ -409,6 +474,7 @@ def detect_category(text: str) -> str:
 # =========================
 #  UI: SIDEBAR (Admin, Premium, Enterprise)
 # =========================
+
 st.sidebar.title("Menu")
 
 is_admin = st.session_state.get("is_admin", False)
@@ -423,25 +489,34 @@ if not PUBLIC_MODE:
             else:
                 st.sidebar.error("Incorrect password.")
 
-    # Admin utilities (always visible to admin)
+    # Admin utilities (visible to admin)
     if is_admin:
         st.sidebar.markdown("### Admin")
         if st.sidebar.button("Rebuild KB Index Now"):
             with st.spinner("Rebuilding index…"):
                 ok = build_index_from_gcs()
             st.sidebar.success("Done." if ok else "No files or failed.")
+
+        # Download today's CSV log (if present)
         day = datetime.datetime.utcnow().strftime("%Y%m%d")
         log_key = f"logs/{COUNCIL}/queries-{day}.csv"
-        if gcs_client().bucket(GCS_BUCKET).blob(log_key).exists():
-            href = signed_url_for_blob_path(f"gs://{GCS_BUCKET}/{log_key}", minutes=60)
-            if href: st.sidebar.markdown(f"[Download today’s log]({href})")
+        try:
+            if gcs_client().bucket(GCS_BUCKET).blob(log_key).exists():
+                href = signed_url_for_blob_path(f"gs://{GCS_BUCKET}/{log_key}", minutes=60)
+                if href:
+                    st.sidebar.markdown(f"[Download today’s log]({href})")
+        except Exception:
+            pass
 
         # Premium features are only shown if enabled AND admin
         if PREMIUM_MODE:
             st.sidebar.markdown("### Inbox (Premium)")
+
             def _decode_header(raw):
-                try: return str(make_header(decode_header(raw or "")))
-                except Exception: return raw or ""
+                try:
+                    return str(make_header(decode_header(raw or "")))
+                except Exception:
+                    return raw or ""
 
             def fetch_recent_emails(limit=25, since_days=7):
                 out = []
@@ -501,7 +576,7 @@ if not PUBLIC_MODE:
             if not inbox:
                 st.sidebar.info("No recent emails or IMAP not configured.")
             else:
-                labels = [f"{i+1}. {(_decode_header(x['subject']) or '(no subject)')[:80]} — {(_decode_header(x['from']) or '(no from)')[:60]}" for i, x in enumerate(inbox)]
+                labels = [f"{i+1}. {( _decode_header(x['subject']) or '(no subject)')[:80]} — {( _decode_header(x['from']) or '(no from)')[:60]}" for i, x in enumerate(inbox)]
                 sel = st.sidebar.selectbox("Select email", range(len(labels)), format_func=lambda i: labels[i])
                 chosen = inbox[sel]
                 st.sidebar.caption("Selected email:")
@@ -509,7 +584,6 @@ if not PUBLIC_MODE:
                 st.sidebar.write(f"**Subject:** {chosen['subject']}")
                 st.sidebar.write((chosen["body"] or "")[:600] + ("..." if len(chosen["body"] or "")>600 else ""))
 
-                # Draft generator
                 def generate_policy_grounded_reply(question_text: str, kb_vs):
                     ctx_docs = []
                     if kb_vs:
@@ -535,7 +609,6 @@ Write in the same language as the incoming message (detected: {lang}).
 [REPLY DRAFT]
 """
                     draft = get_llm().predict(prompt)
-                    # sources
                     srcs = []
                     if ctx_docs:
                         for d in ctx_docs:
@@ -559,9 +632,10 @@ Write in the same language as the incoming message (detected: {lang}).
                     srcs = st.session_state.get("pro_sources", [])
                     if srcs:
                         st.sidebar.caption("Sources:")
-                        for s in srcs[:6]: st.sidebar.code(s)
+                        for s in srcs[:6]:
+                            st.sidebar.code(s)
 
-                    # prep send
+                    # Prepare send
                     to_display = chosen["from"]
                     to_addr = to_display.split("<")[-1].split(">")[0].strip() if "<" in to_display else to_display
                     subj_pref = ("Re: " if not (chosen["subject"] or "").lower().startswith("re:") else "") + (chosen["subject"] or "")
@@ -600,6 +674,7 @@ else:
 # =========================
 #  MAIN MODES
 # =========================
+
 def show_extracts_with_links(docs):
     with st.expander("📄 Relevant Extracts (with sources)"):
         for i, d in enumerate(docs, 1):
@@ -617,10 +692,13 @@ def show_extracts_with_links(docs):
             st.markdown("---")
 
 kb = None
-if PUBLIC_MODE:
-    mode = "Knowledge Base"
+if BASIC_MODE:
+    if PUBLIC_MODE:
+        mode = "Knowledge Base"
+    else:
+        mode = st.radio("Choose a data source", ["Knowledge Base", "Upload a File"], horizontal=True)
 else:
-    mode = st.radio("Choose a data source", ["Knowledge Base", "Upload a File"], horizontal=True)
+    mode = "Upload a File"
 
 if mode == "Knowledge Base":
     kb = load_vectorstore()
@@ -665,7 +743,7 @@ Keep it concise (4–8 sentences).
                     if s not in srcs: srcs.append(s)
             log_query_to_gcs("kb", q, ans, srcs)
 
-    else:
+    else:  # Upload a File
         if PUBLIC_MODE:
             st.error("Uploads are disabled in Public mode.")
         else:
@@ -702,7 +780,7 @@ If unsure, say so and suggest a next step. Include a relevant link if present.
                 st.write(ans)
                 show_extracts_with_links(docs)
                 log_query_to_gcs("upload", q, ans, [])
-                
+
 # Footer
 st.markdown(
     f"""
