@@ -186,21 +186,31 @@ if not chunks:
 print(f"→ Built {len(chunks)} chunks")
 
 print("→ Embedding & building FAISS…")
-# Build embeddings in safe batches to avoid the 300k tokens-per-request cap
+# Build embeddings in safe batches with retries to tolerate transient network issues
+import time
 emb = OpenAIEmbeddings(
     model=args.embedding_model,
-    openai_api_key=os.environ["OPENAI_API_KEY"]
+    openai_api_key=os.environ["OPENAI_API_KEY"],
 )
 vs = None
 batch = max(1, args.embed_batch)
 total = len(chunks)
 for i in range(0, total, batch):
     sub = chunks[i:i+batch]
-    if vs is None:
-        vs = FAISS.from_texts(sub, emb)
-    else:
-        vs.add_texts(sub)
-    if (i // batch) % 10 == 0 or i + batch >= total:
+    for attempt in range(1, 7):  # up to 6 attempts with exponential backoff
+        try:
+            if vs is None:
+                vs = FAISS.from_texts(sub, emb)
+            else:
+                vs.add_texts(sub)
+            break
+        except Exception as e:
+            if attempt == 6:
+                raise
+            wait = min(60, 2 ** attempt)
+            print(f"   [retry {attempt}/6] embedding {i+1}-{min(i+len(sub), total)} failed: {e}. Sleeping {wait}s…")
+            time.sleep(wait)
+    if ((i // batch) % 10) == 0 or i + batch >= total:
         print(f"   …embedded {min(i+batch, total)}/{total}")
 if vs is None:
     sys.exit("No vectors computed.")
@@ -210,11 +220,17 @@ tmp.mkdir(parents=True, exist_ok=True)
 vs.save_local(str(tmp))
 
 print("→ Uploading to GCS…")
+from google.api_core.retry import Retry
+retry = Retry(predicate=Retry.if_transient_error, initial=1.0, maximum=60.0, multiplier=2.0, deadline=900.0)
+
 bucket = cli.bucket(args.bucket)
 for p in tmp.rglob("*"):
     if p.is_file():
         key = f"{args.index_prefix.rstrip('/')}/{p.relative_to(tmp).as_posix()}"
-        bucket.blob(key).upload_from_filename(str(p))
+        bl = bucket.blob(key)
+        # 8MB chunks for resumable uploads; tweak if your network is slow/fast
+        bl.chunk_size = 8 * 1024 * 1024
+        bl.upload_from_filename(str(p), timeout=300, retry=retry)
 
 meta = {
     "generated_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
