@@ -156,6 +156,10 @@ parser.add_argument("--index-prefix", default=os.getenv("INDEX_PREFIX", "faiss_i
                     help="GCS prefix where FAISS artifacts are stored; {slug} will be replaced")
 parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", 1200)))
 parser.add_argument("--overlap", type=int, default=int(os.getenv("CHUNK_OVERLAP", 180)))
+parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+                    help="OpenAI embedding model to use (e.g., text-embedding-3-small)")
+parser.add_argument("--embed-batch", type=int, default=int(os.getenv("EMBED_BATCH", "64")),
+                    help="Max texts per embeddings API call (keeps total tokens < 300k)")
 args = parser.parse_args()
 
 if not os.environ.get("OPENAI_API_KEY"):
@@ -182,7 +186,11 @@ if not chunks:
 print(f"→ Built {len(chunks)} chunks")
 
 print("→ Embedding & building FAISS…")
-emb = OpenAIEmbeddings(openai_api_key=os.environ["OPENAI_API_KEY"])
+emb = OpenAIEmbeddings(
+    model=args.embedding_model,
+    openai_api_key=os.environ["OPENAI_API_KEY"],
+    batch_size=args.embed_batch,
+)
 vs = FAISS.from_texts(chunks, emb)
 
 print("→ Saving artifacts locally…")
