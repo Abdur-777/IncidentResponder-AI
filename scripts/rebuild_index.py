@@ -186,13 +186,24 @@ if not chunks:
 print(f"→ Built {len(chunks)} chunks")
 
 print("→ Embedding & building FAISS…")
+# Build embeddings in safe batches to avoid the 300k tokens-per-request cap
 emb = OpenAIEmbeddings(
     model=args.embedding_model,
-    openai_api_key=os.environ["OPENAI_API_KEY"],
-    batch_size=args.embed_batch,
+    openai_api_key=os.environ["OPENAI_API_KEY"]
 )
-vs = FAISS.from_texts(chunks, emb)
-
+vs = None
+batch = max(1, args.embed_batch)
+total = len(chunks)
+for i in range(0, total, batch):
+    sub = chunks[i:i+batch]
+    if vs is None:
+        vs = FAISS.from_texts(sub, emb)
+    else:
+        vs.add_texts(sub)
+    if (i // batch) % 10 == 0 or i + batch >= total:
+        print(f"   …embedded {min(i+batch, total)}/{total}")
+if vs is None:
+    sys.exit("No vectors computed.")
 print("→ Saving artifacts locally…")
 tmp = Path(tempfile.mkdtemp()) / "faiss"
 tmp.mkdir(parents=True, exist_ok=True)
