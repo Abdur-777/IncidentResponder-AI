@@ -32,13 +32,13 @@ st.set_page_config(page_title="Wyndham — IncidentResponder AI", page_icon="�
 APP_TITLE = "Wyndham — IncidentResponder AI"
 DATA_REGION = os.getenv("DATA_REGION", "australia-southeast1")
 
-# Council + Storage (supports your script's prefixes)
+# Council + Storage (defaults aligned to gs://civreply-data/policies/{slug}/_hash_index)
 COUNCIL_KEY = os.getenv("COUNCIL_KEY", "wyndham")
 GCS_BUCKET  = os.getenv("GCS_BUCKET", "civreply-data")
 
-# New: configurable prefixes that match scripts/rebuild_index.py
-DOC_PREFIX   = os.getenv("DOC_PREFIX",  "policies/{slug}")        # where docs live
-INDEX_PREFIX = os.getenv("INDEX_PREFIX","faiss_indexes/{slug}")   # where FAISS artifacts go
+# Prefixes (docs + index)
+DOC_PREFIX   = os.getenv("DOC_PREFIX",  "policies/{slug}")                  # where documents live
+INDEX_PREFIX = os.getenv("INDEX_PREFIX","policies/{slug}/_hash_index")      # FAISS artifacts location (default updated)
 
 def resolve_prefixes(slug: str = COUNCIL_KEY):
     docs = DOC_PREFIX.format(slug=slug).rstrip("/")
@@ -47,7 +47,7 @@ def resolve_prefixes(slug: str = COUNCIL_KEY):
 
 GCS_DOCS_PREFIX, GCS_INDEX_PREFIX = resolve_prefixes(COUNCIL_KEY)
 
-# Logs & meta (keep logs under docs to keep tidy; meta lives with index)
+# Logs under docs; meta sits with index
 GCS_LOGS_PREFIX = f"{GCS_DOCS_PREFIX}/_logs"
 GCS_META_BLOB   = f"{GCS_INDEX_PREFIX}/index_meta.json"
 
@@ -165,6 +165,8 @@ def rebuild_index_from_gcs(include_patterns=(".pdf", ".PDF")) -> Dict[str, Any]:
         "council": COUNCIL_KEY,
         "chunks": len(split_docs),
         "builder": "app.py(pdf-only)",
+        "index_prefix": GCS_INDEX_PREFIX,
+        "docs_prefix": GCS_DOCS_PREFIX,
     }
     bucket.blob(GCS_META_BLOB).upload_from_string(json.dumps(meta, indent=2), content_type="application/json")
     log_event("reindex_pdf_only", meta)
