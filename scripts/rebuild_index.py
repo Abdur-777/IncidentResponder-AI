@@ -6,18 +6,18 @@ Usage:
     python3 scripts/rebuild_index.py wyndham \
         --bucket civreply-data \
         --docs-prefix policies/{slug} \
-        --index-prefix faiss_indexes/{slug} \
+        --index-prefix policies/{slug}/_hash_index \
         --chunk-size 1200 --overlap 180
 
 Env vars required:
     OPENAI_API_KEY
-    GOOGLE_APPLICATION_CREDENTIALS (path to GCP service account JSON)
+    GOOGLE_APPLICATIONS_CREDENTIALS (path to GCP service account JSON)
 
 Notes:
 - Supports: .pdf, .docx, .pptx, .xlsx, .xls, .csv, .rtf, .txt
 - Writes index.faiss / index.pkl (+ index_meta.json) to the index prefix
 """
-import os, io, csv, json, re, tempfile, datetime, argparse, sys
+import os, io, csv, json, tempfile, datetime, argparse, sys
 from pathlib import Path
 from typing import Iterable, List
 
@@ -118,12 +118,49 @@ EXTRACTORS = {
     ".txt": extract_txt,
 }
 
-# ---------- core ----------
+# ---------- cli ----------
+
+parser = argparse.ArgumentParser(description="Rebuild FAISS from GCS docs and upload to GCS")
+parser.add_argument("slug", help="Council slug, e.g., wyndham")
+parser.add_argument("--bucket", default=os.getenv("GCS_BUCKET", "civreply-data"))
+parser.add_argument("--docs-prefix", default=os.getenv("DOC_PREFIX", "policies/{slug}"),
+                    help="GCS prefix where documents live; {slug} will be replaced")
+parser.add_argument("--index-prefix", default=os.getenv("INDEX_PREFIX", "policies/{slug}/_hash_index"),
+                    help="GCS prefix where FAISS artifacts are stored; {slug} will be replaced")
+parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", 1200)))
+parser.add_argument("--overlap", type=int, default=int(os.getenv("CHUNK_OVERLAP", 180)))
+parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+                    help="OpenAI embedding model to use (e.g., text-embedding-3-small)")
+parser.add_argument("--embed-batch", type=int, default=int(os.getenv("EMBED_BATCH", "64")),
+                    help="Max texts per embeddings API call")
+args = parser.parse_args()
+
+if not os.environ.get("OPENAI_API_KEY"):
+    sys.exit("Missing OPENAI_API_KEY")
+
+# Resolve prefixes
+args.docs_prefix = args.docs_prefix.format(slug=args.slug).rstrip("/")
+args.index_prefix = args.index_prefix.format(slug=args.slug).rstrip("/")
+
+print(f"→ Using bucket: {args.bucket}")
+print(f"→ Docs prefix: gs://{args.bucket}/{args.docs_prefix}")
+print(f"→ Index out : gs://{args.bucket}/{args.index_prefix}")
+
+cli = storage.Client()
+
+# ---------- list blobs ----------
 
 def list_supported_blobs(cli: storage.Client, bucket: str, prefix: str):
     prefix = prefix.rstrip("/") + "/"
     return [b for b in cli.list_blobs(bucket, prefix=prefix)
             if b.name.lower().endswith(SUPPORTED_EXTS)]
+
+blobs = list_supported_blobs(cli, args.bucket, args.docs_prefix)
+if not blobs:
+    sys.exit(f"No docs found under gs://{args.bucket}/{args.docs_prefix}")
+print(f"→ Found {len(blobs)} file(s)")
+
+# ---------- chunk builder ----------
 
 def build_chunks_from_blobs(blobs) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=args.chunk_size,
@@ -145,48 +182,15 @@ def build_chunks_from_blobs(blobs) -> List[str]:
             print(f"   [skip error] {b.name}: {e}")
     return chunks
 
-# ---------- cli ----------
-
-parser = argparse.ArgumentParser(description="Rebuild FAISS from GCS docs and upload to GCS")
-parser.add_argument("slug", help="Council slug, e.g., wyndham")
-parser.add_argument("--bucket", default=os.getenv("GCS_BUCKET", "civreply-data"))
-parser.add_argument("--docs-prefix", default=os.getenv("DOC_PREFIX", "policies/{slug}"),
-                    help="GCS prefix where documents live; {slug} will be replaced")
-parser.add_argument("--index-prefix", default=os.getenv("INDEX_PREFIX", "faiss_indexes/{slug}"),
-                    help="GCS prefix where FAISS artifacts are stored; {slug} will be replaced")
-parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", 1200)))
-parser.add_argument("--overlap", type=int, default=int(os.getenv("CHUNK_OVERLAP", 180)))
-parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
-                    help="OpenAI embedding model to use (e.g., text-embedding-3-small)")
-parser.add_argument("--embed-batch", type=int, default=int(os.getenv("EMBED_BATCH", "64")),
-                    help="Max texts per embeddings API call (keeps total tokens < 300k)")
-args = parser.parse_args()
-
-if not os.environ.get("OPENAI_API_KEY"):
-    sys.exit("Missing OPENAI_API_KEY")
-
-# Resolve prefixes
-args.docs_prefix = args.docs_prefix.format(slug=args.slug)
-args.index_prefix = args.index_prefix.format(slug=args.slug)
-
-print(f"→ Using bucket: {args.bucket}")
-print(f"→ Docs prefix: gs://{args.bucket}/{args.docs_prefix}")
-print(f"→ Index out : gs://{args.bucket}/{args.index_prefix}")
-
-cli = storage.Client()
-blobs = list_supported_blobs(cli, args.bucket, args.docs_prefix)
-if not blobs:
-    sys.exit(f"No docs found under gs://{args.bucket}/{args.docs_prefix}")
-print(f"→ Found {len(blobs)} file(s)")
-
 print("→ Extracting & chunking…")
 chunks = build_chunks_from_blobs(blobs)
 if not chunks:
     sys.exit("No text chunks created — nothing to index.")
 print(f"→ Built {len(chunks)} chunks")
 
+# ---------- build embeddings + FAISS ----------
+
 print("→ Embedding & building FAISS…")
-# Build embeddings in safe batches with retries to tolerate transient network issues
 import time
 emb = OpenAIEmbeddings(
     model=args.embedding_model,
@@ -214,6 +218,9 @@ for i in range(0, total, batch):
         print(f"   …embedded {min(i+batch, total)}/{total}")
 if vs is None:
     sys.exit("No vectors computed.")
+
+# ---------- save & upload ----------
+
 print("→ Saving artifacts locally…")
 tmp = Path(tempfile.mkdtemp()) / "faiss"
 tmp.mkdir(parents=True, exist_ok=True)
@@ -222,22 +229,28 @@ vs.save_local(str(tmp))
 print("→ Uploading to GCS…")
 from google.api_core.retry import Retry
 retry = Retry(predicate=Retry.if_transient_error, initial=1.0, maximum=60.0, multiplier=2.0, deadline=900.0)
-
 bucket = cli.bucket(args.bucket)
+
+# Clear previous index
+for b in list(bucket.list_blobs(prefix=f"{args.index_prefix}/")):
+    b.delete()
+
 for p in tmp.rglob("*"):
     if p.is_file():
-        key = f"{args.index_prefix.rstrip('/')}/{p.relative_to(tmp).as_posix()}"
+        key = f"{args.index_prefix}/{p.relative_to(tmp).as_posix()}"
         bl = bucket.blob(key)
-        # 8MB chunks for resumable uploads; tweak if your network is slow/fast
-        bl.chunk_size = 8 * 1024 * 1024
+        bl.chunk_size = 8 * 1024 * 1024  # 8MB
         bl.upload_from_filename(str(p), timeout=300, retry=retry)
 
 meta = {
     "generated_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     "council": args.slug,
     "chunks": len(chunks),
+    "docs_prefix": args.docs_prefix,
+    "index_prefix": args.index_prefix,
+    "embedding_model": args.embedding_model,
 }
-bucket.blob(f"{args.index_prefix.rstrip('/')}/index_meta.json").upload_from_string(
+bucket.blob(f"{args.index_prefix}/index_meta.json").upload_from_string(
     json.dumps(meta, indent=2).encode("utf-8"), content_type="application/json"
 )
 
