@@ -21,3 +21,5 @@ python-pptx
 striprtf
 pandas
 xlrd
+requests
+beautifulsoup4
