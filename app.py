@@ -2,13 +2,13 @@
 # IncidentResponder AI — Wyndham
 # Staff assistant over council policy knowledge
 # Region: AU (australia-southeast1)
-# Features merged:
+# Features:
 #  - Save uploaded file to KB (GCS) + auto reindex
-#  - Admin panel: Rebuild index + Logs
+#  - Admin panel: Rebuild index (PDF-only or multi-format via script) + Logs
 #  - RAG over FAISS index stored in GCS
 # =========================
 
-import os, io, re, json, time, shutil, datetime, tempfile, traceback
+import os, io, re, json, time, shutil, datetime, tempfile, traceback, subprocess, shlex
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -32,13 +32,24 @@ st.set_page_config(page_title="Wyndham — IncidentResponder AI", page_icon="�
 APP_TITLE = "Wyndham — IncidentResponder AI"
 DATA_REGION = os.getenv("DATA_REGION", "australia-southeast1")
 
-# Council + Storage
+# Council + Storage (supports your script's prefixes)
 COUNCIL_KEY = os.getenv("COUNCIL_KEY", "wyndham")
-GCS_BUCKET = os.getenv("GCS_BUCKET", "civreply-data")
-GCS_DOCS_PREFIX = f"policies/{COUNCIL_KEY}"
-GCS_INDEX_PREFIX = f"{GCS_DOCS_PREFIX}/_hash_index"
+GCS_BUCKET  = os.getenv("GCS_BUCKET", "civreply-data")
+
+# New: configurable prefixes that match scripts/rebuild_index.py
+DOC_PREFIX   = os.getenv("DOC_PREFIX",  "policies/{slug}")        # where docs live
+INDEX_PREFIX = os.getenv("INDEX_PREFIX","faiss_indexes/{slug}")   # where FAISS artifacts go
+
+def resolve_prefixes(slug: str = COUNCIL_KEY):
+    docs = DOC_PREFIX.format(slug=slug).rstrip("/")
+    idx  = INDEX_PREFIX.format(slug=slug).rstrip("/")
+    return docs, idx
+
+GCS_DOCS_PREFIX, GCS_INDEX_PREFIX = resolve_prefixes(COUNCIL_KEY)
+
+# Logs & meta (keep logs under docs to keep tidy; meta lives with index)
 GCS_LOGS_PREFIX = f"{GCS_DOCS_PREFIX}/_logs"
-GCS_MANIFEST_BLOB = f"{GCS_INDEX_PREFIX}/manifest.json"
+GCS_META_BLOB   = f"{GCS_INDEX_PREFIX}/index_meta.json"
 
 # Admin
 ADMIN_PIN = os.getenv("ADMIN_PIN", "4242")
@@ -65,7 +76,7 @@ def _download_gcs_dir(bucket: storage.Bucket, prefix: str, local_dir: Path):
     if local_dir.exists():
         shutil.rmtree(local_dir)
     _ensure_tmp_dir(local_dir)
-    for blob in bucket.list_blobs(prefix=prefix):
+    for blob in bucket.list_blobs(prefix=prefix.rstrip("/") + "/"):
         if blob.name.endswith("/"):
             continue
         rel = blob.name[len(prefix):].lstrip("/")
@@ -78,24 +89,29 @@ def _upload_dir_to_gcs(bucket: storage.Bucket, local_dir: Path, gcs_prefix: str)
         for f in files:
             p = Path(root) / f
             rel = str(p.relative_to(local_dir))
-            bucket.blob(f"{gcs_prefix}/{rel}").upload_from_filename(str(p))
+            bucket.blob(f"{gcs_prefix.rstrip('/')}/{rel}").upload_from_filename(str(p))
 
 def _upload_bytes_to_gcs(bucket: storage.Bucket, dest_path: str, payload: bytes, content_type="application/pdf"):
     blob = bucket.blob(dest_path)
     blob.cache_control = "no-cache"
     blob.upload_from_string(payload, content_type=content_type)
 
-def _write_manifest(bucket: storage.Bucket, info: Dict[str, Any]):
-    bucket.blob(GCS_MANIFEST_BLOB).upload_from_string(json.dumps(info, indent=2), content_type="application/json")
-
-def _read_manifest(bucket: storage.Bucket) -> Optional[Dict[str, Any]]:
-    blob = bucket.blob(GCS_MANIFEST_BLOB)
-    if not blob.exists():
-        return None
-    try:
-        return json.loads(blob.download_as_text())
-    except Exception:
-        return None
+def _read_index_meta(bucket: storage.Bucket) -> Optional[Dict[str, Any]]:
+    # Prefer the script’s index_meta.json
+    meta_blob = bucket.blob(GCS_META_BLOB)
+    if meta_blob.exists():
+        try:
+            return json.loads(meta_blob.download_as_text())
+        except Exception:
+            pass
+    # Backward-compat: read an old manifest if present
+    legacy = bucket.blob(f"{GCS_INDEX_PREFIX}/manifest.json")
+    if legacy.exists():
+        try:
+            return json.loads(legacy.download_as_text())
+        except Exception:
+            pass
+    return None
 
 def log_event(event_type: str, payload: Dict[str, Any]):
     try:
@@ -110,7 +126,8 @@ def log_event(event_type: str, payload: Dict[str, Any]):
 # -------------- Index Helpers --------------
 def rebuild_index_from_gcs(include_patterns=(".pdf", ".PDF")) -> Dict[str, Any]:
     """
-    Pull PDFs from GCS -> /tmp, build FAISS, push index back to GCS, write manifest.
+    Simple PDF-only rebuild inside the app:
+    Pull PDFs from GCS -> /tmp, build FAISS, push index back to GCS, write minimal meta.
     """
     t0 = time.time()
     client = gcs_client()
@@ -123,7 +140,6 @@ def rebuild_index_from_gcs(include_patterns=(".pdf", ".PDF")) -> Dict[str, Any]:
     # 2) Load + split
     loader = PyPDFDirectoryLoader(str(tmp_docs))
     docs = loader.load()
-    # Filter by extension (safety)
     docs = [d for d in docs if any(str(d.metadata.get("source", "")).endswith(ext) for ext in include_patterns)]
     splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180)
     split_docs = splitter.split_documents(docs)
@@ -138,24 +154,56 @@ def rebuild_index_from_gcs(include_patterns=(".pdf", ".PDF")) -> Dict[str, Any]:
         shutil.rmtree(tmp_index)
     db.save_local(str(tmp_index))
 
-    # Clear previous index path in GCS, then upload
+    # Replace previous index path in GCS, then upload
     for b in list(bucket.list_blobs(prefix=f"{GCS_INDEX_PREFIX}/")):
         b.delete()
     _upload_dir_to_gcs(bucket, tmp_index, GCS_INDEX_PREFIX)
 
-    dt = datetime.datetime.utcnow().isoformat() + "Z"
-    manifest = {
+    dt = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    meta = {
+        "generated_at_utc": dt,
         "council": COUNCIL_KEY,
-        "gcs_bucket": GCS_BUCKET,
-        "gcs_docs_prefix": GCS_DOCS_PREFIX,
-        "gcs_index_prefix": GCS_INDEX_PREFIX,
-        "docs_count": len(split_docs),
-        "updated_at_utc": dt,
-        "build_seconds": round(time.time() - t0, 2),
+        "chunks": len(split_docs),
+        "builder": "app.py(pdf-only)",
     }
-    _write_manifest(bucket, manifest)
-    log_event("reindex", manifest)
-    return manifest
+    bucket.blob(GCS_META_BLOB).upload_from_string(json.dumps(meta, indent=2), content_type="application/json")
+    log_event("reindex_pdf_only", meta)
+    return meta
+
+def rebuild_index_via_script(
+    slug: str = COUNCIL_KEY,
+    bucket: str = GCS_BUCKET,
+    docs_prefix_tmpl: str = DOC_PREFIX,
+    index_prefix_tmpl: str = INDEX_PREFIX,
+    chunk_size: int = 1200,
+    overlap: int = 180,
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+    embed_batch: int = int(os.getenv("EMBED_BATCH", "64")),
+) -> Dict[str, Any]:
+    """
+    Calls scripts/rebuild_index.py as a subprocess so we get multi-format support.
+    """
+    cmd = (
+        f"python3 scripts/rebuild_index.py {shlex.quote(slug)} "
+        f"--bucket {shlex.quote(bucket)} "
+        f"--docs-prefix {shlex.quote(docs_prefix_tmpl)} "
+        f"--index-prefix {shlex.quote(index_prefix_tmpl)} "
+        f"--chunk-size {chunk_size} --overlap {overlap} "
+        f"--embedding-model {shlex.quote(embedding_model)} "
+        f"--embed-batch {embed_batch}"
+    )
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    ok = proc.returncode == 0
+    out = proc.stdout.strip()
+    err = proc.stderr.strip()
+    if not ok:
+        raise RuntimeError(f"rebuild_index.py failed ({proc.returncode}).\nSTDOUT:\n{out}\n\nSTDERR:\n{err}")
+    # After success, read fresh meta
+    client = gcs_client(); bucket_obj = client.bucket(bucket)
+    meta = _read_index_meta(bucket_obj) or {}
+    meta["stdout"] = out[-4000:]  # keep tail for UI
+    log_event("reindex_script", {"ok": True, **meta})
+    return meta
 
 def load_faiss_from_gcs() -> Optional[FAISS]:
     """
@@ -166,7 +214,6 @@ def load_faiss_from_gcs() -> Optional[FAISS]:
     tmp_index = Path("/tmp/current_index")
     _download_gcs_dir(bucket, f"{GCS_INDEX_PREFIX}/", tmp_index)
 
-    # FAISS expects two files: index.faiss and index.pkl
     faiss_bin = tmp_index / "index.faiss"
     faiss_pkl = tmp_index / "index.pkl"
     if not (faiss_bin.exists() and faiss_pkl.exists()):
@@ -177,14 +224,15 @@ def load_faiss_from_gcs() -> Optional[FAISS]:
 
 def upload_uploaded_file_to_kb(uploaded_file, subdir="uploads") -> str:
     """
-    Save an uploaded file into gs://<bucket>/policies/<council>/<subdir>/... and return its GCS path.
+    Save an uploaded file into gs://<bucket>/<DOC_PREFIX>/<subdir>/... and return its GCS path.
     """
     client = gcs_client()
     bucket = client.bucket(GCS_BUCKET)
     ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     safe_name = uploaded_file.name.replace("/", "_")
+    ctype = uploaded_file.type or "application/octet-stream"
     dest = f"{GCS_DOCS_PREFIX}/{subdir}/{ts}-{safe_name}"
-    _upload_bytes_to_gcs(bucket, dest, uploaded_file.getvalue(), content_type=uploaded_file.type or "application/pdf")
+    _upload_bytes_to_gcs(bucket, dest, uploaded_file.getvalue(), content_type=ctype)
     log_event("upload_to_kb", {"dest": dest, "size_bytes": len(uploaded_file.getvalue())})
     return dest
 
@@ -200,22 +248,34 @@ def answer_with_retriever(retriever, question: str) -> Dict[str, Any]:
     result = chain({"query": question})
     return result
 
+def _parse_source_from_chunk(txt: str) -> Optional[str]:
+    # Expect the very first line to be like: [SOURCE] gs://bucket/path/to/file.ext
+    first = (txt or "").splitlines()[:2]
+    for line in first:
+        m = re.match(r"\[SOURCE\]\s+(gs://\S+)", line.strip())
+        if m:
+            return m.group(1)
+    return None
+
 def render_sources(docs: List[Document]):
     if not docs:
         return
     with st.expander("Sources", expanded=False):
         for i, d in enumerate(docs, 1):
-            src = d.metadata.get("source", "unknown")
-            page = d.metadata.get("page", None)
+            src = getattr(d, "metadata", {}).get("source") if hasattr(d, "metadata") else None
+            if not src:
+                src = _parse_source_from_chunk(getattr(d, "page_content", ""))
+            page = getattr(d, "metadata", {}).get("page") if hasattr(d, "metadata") else None
             pg = f" • p.{page+1}" if isinstance(page, int) else ""
-            st.markdown(f"{i}. `{os.path.basename(src)}`{pg}")
+            label = src or "unknown"
+            st.markdown(f"{i}. `{label}`{pg}")
 
 # -------------- UI: Header --------------
 def header():
     client = gcs_client()
     bucket = client.bucket(GCS_BUCKET)
-    manifest = _read_manifest(bucket)
-    ts = manifest.get("updated_at_utc") if manifest else "—"
+    manifest = _read_index_meta(bucket)
+    ts = (manifest or {}).get("generated_at_utc") or (manifest or {}).get("updated_at_utc") or "—"
     col1, col2 = st.columns([0.7, 0.3])
     with col1:
         st.title(APP_TITLE)
@@ -228,13 +288,10 @@ def header():
 
 # -------------- UI: Footer Info --------------
 def footer_info():
-    st.markdown(
-        f"<hr style='opacity:0.2'/>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<hr style='opacity:0.2'/>", unsafe_allow_html=True)
     st.caption(
-        f"Council: **{COUNCIL_KEY}**  •  Bucket: **{GCS_BUCKET}**  •  Docs: **{GCS_DOCS_PREFIX}**  •  "
-        f"Index: **{GCS_INDEX_PREFIX}**  •  Data region: **{DATA_REGION}**"
+        f"Council: **{COUNCIL_KEY}**  •  Bucket: **{GCS_BUCKET}**  •  "
+        f"Docs: **{GCS_DOCS_PREFIX}**  •  Index: **{GCS_INDEX_PREFIX}**  •  Data region: **{DATA_REGION}**"
     )
     st.caption("© 2025 IncidentResponder AI")
 
@@ -248,11 +305,34 @@ def admin_sidebar():
         if st.session_state.get("admin"):
             st.success("Admin unlocked")
 
-            if st.button("🔄 Rebuild index now"):
+            if st.button("🔄 Rebuild index now (PDF-only)"):
                 with st.spinner("Rebuilding…"):
                     info = rebuild_index_from_gcs()
                 st.toast("Index rebuilt")
                 st.json(info)
+
+            with st.expander("⚙️ Advanced rebuild (use script)", expanded=False):
+                csize   = st.number_input("Chunk size", 200, 4000, 1200, 50)
+                cover   = st.number_input("Chunk overlap", 0, 1000, 180, 10)
+                emodel  = st.text_input("Embedding model", os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"))
+                ebatch  = st.number_input("Embed batch", 1, 512, int(os.getenv("EMBED_BATCH", "64")), 1)
+                if st.button("Run scripts/rebuild_index.py"):
+                    with st.spinner("Rebuilding via script… (multi-format)"):
+                        try:
+                            info = rebuild_index_via_script(
+                                slug=COUNCIL_KEY,
+                                bucket=GCS_BUCKET,
+                                docs_prefix_tmpl=DOC_PREFIX,
+                                index_prefix_tmpl=INDEX_PREFIX,
+                                chunk_size=int(csize),
+                                overlap=int(cover),
+                                embedding_model=emodel,
+                                embed_batch=int(ebatch),
+                            )
+                            st.success("Index rebuilt with script")
+                            st.json(info)
+                        except Exception as e:
+                            st.error(str(e))
 
             if st.button("📜 Refresh logs"):
                 pass
@@ -262,8 +342,7 @@ def admin_sidebar():
                 client = gcs_client(); bucket = client.bucket(GCS_BUCKET)
                 blobs = sorted(
                     [b for b in bucket.list_blobs(prefix=f"{GCS_LOGS_PREFIX}/")],
-                    key=lambda b: b.name,
-                    reverse=True
+                    key=lambda b: b.name, reverse=True
                 )[:200]
                 rows = []
                 for b in blobs:
@@ -329,7 +408,7 @@ def upload_mode():
       - Else ephemeral, indexed only in-session
     """
     st.radio("Choose a data source", ["Knowledge Base", "Upload a File"], index=1, key="ds_up", horizontal=True)
-    up = st.file_uploader("Upload a PDF", type=["pdf"])
+    up = st.file_uploader("Upload a document", type=["pdf", "docx", "pptx", "xlsx", "xls", "csv", "rtf", "txt"])
     save_to_kb = st.checkbox("Save uploaded file to Knowledge Base (and reindex)", value=True)
 
     if "ephemeral_db" not in st.session_state:
@@ -341,15 +420,15 @@ def upload_mode():
         if save_to_kb:
             try:
                 dest = upload_uploaded_file_to_kb(up)
-                with st.spinner("Rebuilding index…"):
-                    info = rebuild_index_from_gcs()
+                with st.spinner("Rebuilding index via script (multi-format)…"):
+                    info = rebuild_index_via_script()
                 st.success(f"Saved to GCS and reindexed.\nPath: gs://{GCS_BUCKET}/{dest}")
                 st.caption(f"Index: gs://{GCS_BUCKET}/{GCS_INDEX_PREFIX}")
                 st.json(info)
             except Exception as e:
                 st.error(f"Could not save/reindex: {e}")
         else:
-            # Ephemeral local index (session-only)
+            # Ephemeral local index (session-only) for PDFs (fast path)
             try:
                 tmp_dir = Path("/tmp/session_upload")
                 if tmp_dir.exists(): shutil.rmtree(tmp_dir)
@@ -366,7 +445,7 @@ def upload_mode():
                 db = FAISS.from_documents(split_docs, embeddings)
                 st.session_state["ephemeral_db"] = db
                 st.session_state["ephemeral_retriever"] = db.as_retriever(search_kwargs={"k": TOP_K})
-                st.success("Loaded file for this session. Ask away below.")
+                st.success("Loaded PDF for this session. Ask away below.")
             except Exception as e:
                 st.error(f"Could not process file: {e}")
 
@@ -402,7 +481,6 @@ def main():
     header()
     admin_sidebar()
 
-    # Mode switcher
     tabs = st.tabs(["Knowledge Base", "Upload a File"])
     with tabs[0]:
         kb_mode()
