@@ -1,9 +1,13 @@
-name: Weekly Crawl + Reindex
+name: Weekly Crawl + Reindex (_hash_index)
 
 on:
   schedule:
-    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+    - cron: "0 3 * * 1"   # Mondays 03:00 UTC
   workflow_dispatch:
+
+concurrency:
+  group: refresh-crawl-reindex
+  cancel-in-progress: false
 
 jobs:
   refresh:
@@ -14,27 +18,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Auth to GCP (use workload identity or a JSON key secret)
-      - uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_JSON }}
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: pip install -r requirements.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Crawl Wyndham PDFs
+      # Auth to GCP (ADC for python client libs)
+      - name: Google Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_JSON }}
+
+      - name: Crawl Wyndham PDFs to GCS
         env:
           GCS_BUCKET: civreply-data
           DOCS_PREFIX: policies/wyndham/crawl
           CRAWL_BASE: https://www.wyndham.vic.gov.au
-        run: python scripts/crawl_wyndham.py
+        run: |
+          python scripts/crawl_site.py wyndham \
+            --base "$CRAWL_BASE" \
+            --bucket "$GCS_BUCKET" \
+            --docs-prefix "$DOCS_PREFIX" \
+            --file-exts .pdf
 
-      - name: Rebuild FAISS Index
+      - name: Rebuild FAISS index at policies/{slug}/_hash_index
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GCS_BUCKET: civreply-data
-          COUNCIL_KEY: wyndham
-        run: python -c "from app import rebuild_index_from_gcs; print(rebuild_index_from_gcs())"
+          DOC_PREFIX: policies/{slug}
+          INDEX_PREFIX: policies/{slug}/_hash_index
+        run: |
+          python scripts/rebuild_index.py wyndham
