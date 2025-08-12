@@ -1,57 +1,40 @@
-name: Wyndham nightly refresh
+name: Weekly Crawl + Reindex
 
 on:
   schedule:
-    # 16:00 UTC ≈ 02:00 AEST (+/- DST). Adjust if you want.
-    - cron: "0 16 * * *"
-  workflow_dispatch: {}
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
 
 jobs:
-  crawl:
+  refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # Auth to GCP (use workload identity or a JSON key secret)
+      - uses: google-github-actions/auth@v2
         with:
-          python-version: "3.10"
+          credentials_json: ${{ secrets.GCP_SA_JSON }}
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Auth to GCP (service account JSON from secret)
+      - run: pip install -r requirements.txt
+
+      - name: Crawl Wyndham PDFs
         env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-        run: |
-          echo "$GCP_SA_JSON" > $HOME/gcs-key.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/gcs-key.json" >> $GITHUB_ENV
+          GCS_BUCKET: civreply-data
+          DOCS_PREFIX: policies/wyndham/crawl
+          CRAWL_BASE: https://www.wyndham.vic.gov.au
+        run: python scripts/crawl_wyndham.py
 
-      - name: Run deep crawler -> uploads to GCS
-        env:
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}   # e.g. civreply-data
-          COUNCIL: wyndham
-          DOC_PREFIX: policies/wyndham
-          INCLUDE_IMAGES: "false"                 # set "true" if you want images
-          HTTP_TIMEOUT: "25"
-        run: |
-          python -u wyndham_gcs_downloader_v2.py
-
-      - name: (Optional) Rebuild FAISS index and upload
-        if: ${{ vars.REBUILD_INDEX == 'true' }}
+      - name: Rebuild FAISS Index
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-          COUNCIL: wyndham
-          DOC_PREFIX: policies/wyndham
-          INDEX_PREFIX: indexes/wyndham/faiss
-        run: |
-          python - <<'PY'
-          import os
-          from build_index_from_gcs import build  # if you kept a helper; else call inside app
-          build()
-          PY
+          GCS_BUCKET: civreply-data
+          COUNCIL_KEY: wyndham
+        run: python -c "from app import rebuild_index_from_gcs; print(rebuild_index_from_gcs())"
